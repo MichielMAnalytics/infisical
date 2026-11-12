@@ -27,6 +27,7 @@ import { useProject } from "@app/context";
 import { useRevokeCert } from "@app/hooks/api";
 import { crlReasons } from "@app/hooks/api/certificates/constants";
 import { CrlReason } from "@app/hooks/api/certificates/enums";
+import { CertificateRevocationStatus } from "@app/hooks/api/certificates/types";
 import { UsePopUpState } from "@app/hooks/usePopUp";
 
 const schema = z.object({
@@ -72,7 +73,7 @@ export const CertificateRevocationModal = ({ popUp, handlePopUpToggle }: Props) 
 
     const { certificateId } = popUp.revokeCertificate.data as { certificateId: string };
 
-    await revokeCertificate({
+    const { status } = await revokeCertificate({
       id: certificateId,
       revocationReason
     });
@@ -81,7 +82,10 @@ export const CertificateRevocationModal = ({ popUp, handlePopUpToggle }: Props) 
     handlePopUpToggle("revokeCertificate", false);
 
     createNotification({
-      text: "Successfully revoked certificate",
+      text:
+        status === CertificateRevocationStatus.PendingApproval
+          ? "Revocation request submitted. The certificate stays active until the request is approved."
+          : "Successfully revoked certificate",
       type: "success"
     });
   };

@@ -102,6 +102,19 @@ export type TRevokeCertDTO = {
   revocationReason: string;
 };
 
+export enum CertificateRevocationStatus {
+  Revoked = "revoked",
+  PendingApproval = "pending_approval"
+}
+
+export type TRevokeCertResponse = {
+  message: string;
+  status: CertificateRevocationStatus;
+  serialNumber: string;
+  revokedAt?: string;
+  approvalRequestId?: string;
+};
+
 export type TImportPkcs12EntriesDTO = {
   entries: TPkcs12Entry[];
   applicationId?: string;

@@ -3,7 +3,7 @@ import { ForbiddenError, subject } from "@casl/ability";
 import * as x509 from "@peculiar/x509";
 
 import { ActionProjectType, ProjectMembershipRole, ResourceType } from "@app/db/schemas";
-import { TAuditLogServiceFactory } from "@app/ee/services/audit-log/audit-log-types";
+import { EventType, TAuditLogServiceFactory } from "@app/ee/services/audit-log/audit-log-types";
 import { TCertificateAuthorityCrlDALFactory } from "@app/ee/services/certificate-authority-crl/certificate-authority-crl-dal";
 import { TLicenseServiceFactory } from "@app/ee/services/license/license-service";
 import { TPermissionServiceFactory } from "@app/ee/services/permission/permission-service-types";
@@ -21,7 +21,17 @@ import { TKeyStoreFactory } from "@app/keystore/keystore";
 import { crypto } from "@app/lib/crypto/cryptography";
 import { BadRequestError, ForbiddenRequestError, NotFoundError } from "@app/lib/errors";
 import { logger } from "@app/lib/logger";
+import { ms } from "@app/lib/ms";
 import { Pkcs12PasswordSchema } from "@app/lib/validator/password-policy";
+import { TApprovalPolicyDALFactory } from "@app/services/approval-policy/approval-policy-dal";
+import { ApprovalPolicyType, ApprovalRequestStatus } from "@app/services/approval-policy/approval-policy-enums";
+import { TApprovalPolicyServiceFactory } from "@app/services/approval-policy/approval-policy-service";
+import { TApprovalRequest } from "@app/services/approval-policy/approval-policy-types";
+import { TApprovalRequestDALFactory } from "@app/services/approval-policy/approval-request-dal";
+import {
+  TCertRevocationPolicy,
+  TCertRevocationRequestData
+} from "@app/services/approval-policy/cert-revocation/cert-revocation-policy-types";
 import { ActorType } from "@app/services/auth/auth-type";
 import type { TCaKeySourceServiceFactory } from "@app/services/certificate-authority/ca-key-source/ca-key-source-service";
 import { TCertificateAuthorityCertDALFactory } from "@app/services/certificate-authority/certificate-authority-cert-dal";
@@ -75,6 +85,8 @@ import { TProjectDALFactory } from "@app/services/project/project-dal";
 import { getProjectKmsCertificateKeyId } from "@app/services/project/project-fns";
 import { TResourceMetadataDALFactory } from "@app/services/resource-metadata/resource-metadata-dal";
 import { TSignerDALFactory } from "@app/services/signer/signer-dal";
+import { TTelemetryServiceFactory } from "@app/services/telemetry/telemetry-service";
+import { PostHogEventTypes } from "@app/services/telemetry/telemetry-types";
 import { TUserDALFactory } from "@app/services/user/user-dal";
 
 import {
@@ -121,8 +133,10 @@ import { TCertificateSecretDALFactory } from "./certificate-secret-dal";
 import {
   CertExtendedKeyUsage,
   CertExtendedKeyUsageOIDToName,
+  CertificateRevocationStatus,
   CertKeyUsage,
   CertStatus,
+  CrlReason,
   TAssignCertToApplicationDTO,
   TCertificateBasicConstraints,
   TCertificateFingerprints,
@@ -152,6 +166,7 @@ type TCertificateServiceFactoryDep = {
     | "updateById"
     | "findByIdForUpdate"
     | "primaryNode"
+    | "findPendingRevocationApprovalRequest"
   >;
   pkiApplicationDAL: Pick<TPkiApplicationDALFactory, "findById">;
   certificateProfileDAL: Pick<TCertificateProfileDALFactory, "findByIdWithConfigs">;
@@ -191,6 +206,10 @@ type TCertificateServiceFactoryDep = {
   usageMeteringService: Pick<TUsageMeteringServiceFactory, "emitForProject">;
   caKeySourceService: Pick<TCaKeySourceServiceFactory, "buildSigner">;
   internalCertificateAuthorityDAL: Pick<TInternalCertificateAuthorityDALFactory, "update">;
+  approvalPolicyService: Pick<TApprovalPolicyServiceFactory, "matchPolicy" | "createRequestFromPolicy">;
+  approvalPolicyDAL: Pick<TApprovalPolicyDALFactory, "findStepsByPolicyId">;
+  approvalRequestDAL: Pick<TApprovalRequestDALFactory, "updateById">;
+  telemetryService: Pick<TTelemetryServiceFactory, "sendPostHogEvents">;
 };
 
 export type TCertificateServiceFactory = ReturnType<typeof certificateServiceFactory>;
@@ -231,7 +250,11 @@ export const certificateServiceFactory = ({
   internalCertificateAuthorityDAL,
   signerDAL,
   userDAL,
-  identityDAL
+  identityDAL,
+  approvalPolicyService,
+  approvalPolicyDAL,
+  approvalRequestDAL,
+  telemetryService
 }: TCertificateServiceFactoryDep) => {
   const $canActOnCertViaApplication = async (
     cert: { applicationId?: string | null; projectId: string },
@@ -656,16 +679,12 @@ export const certificateServiceFactory = ({
     }
   };
 
-  const revokeCert = async ({
+  const $findCertificateToRevoke = async ({
     id,
     serialNumber,
     thumbprint,
-    revocationReason,
-    actorId,
-    actorAuthMethod,
-    actor,
     actorOrgId
-  }: TRevokeCertDTO) => {
+  }: Pick<TRevokeCertDTO, "id" | "serialNumber" | "thumbprint" | "actorOrgId">) => {
     let cert: Awaited<ReturnType<typeof certificateDAL.findById>> | undefined;
     if (id) {
       cert = await certificateDAL.findById(id);
@@ -698,6 +717,12 @@ export const certificateServiceFactory = ({
       throw new NotFoundError({ message: "Certificate not found" });
     }
 
+    return cert;
+  };
+
+  type TRevocableCertificate = Awaited<ReturnType<typeof $findCertificateToRevoke>>;
+
+  const $loadRevocationCa = async (cert: TRevocableCertificate) => {
     if (!cert.caId) {
       throw new BadRequestError({
         message: "Cannot revoke imported certificates"
@@ -706,7 +731,6 @@ export const certificateServiceFactory = ({
 
     const ca = await certificateAuthorityDAL.findByIdWithAssociatedCa(cert.caId);
 
-    // Check if the CA type supports revocation
     const caType = (ca.externalCa?.type as CaType) ?? CaType.INTERNAL;
     if (!caSupportsCapability(caType, CaCapability.REVOKE_CERTIFICATES)) {
       throw new BadRequestError({
@@ -714,16 +738,12 @@ export const certificateServiceFactory = ({
       });
     }
 
-    await assertCanRevokeCertificate({
-      certificate: { ...cert, projectId: ca.projectId },
-      actor,
-      actorId,
-      actorAuthMethod,
-      actorOrgId,
-      permissionService,
-      resourceMetadataDAL
-    });
+    return ca;
+  };
 
+  type TRevocationCa = Awaited<ReturnType<typeof $loadRevocationCa>>;
+
+  const $assertCertificateRevocable = async (cert: TRevocableCertificate, ca: TRevocationCa) => {
     if (cert.status === CertStatus.REVOKED) {
       throw new BadRequestError({ message: `Certificate '${getCertificateDisplayName(cert)}' is already revoked.` });
     }
@@ -755,7 +775,19 @@ export const certificateServiceFactory = ({
         licenseService
       });
     }
+  };
 
+  const $performRevocation = async ({
+    cert,
+    ca,
+    revocationReason,
+    orgId
+  }: {
+    cert: TRevocableCertificate;
+    ca: TRevocationCa;
+    revocationReason: CrlReason;
+    orgId: string;
+  }) => {
     // Call the upstream CA first so we don't end up with a cert that's revoked locally but still
     // active at the issuer (e.g., when the upstream rejects the chosen revocation reason).
     if (
@@ -797,7 +829,7 @@ export const certificateServiceFactory = ({
       await certificateAlertEventEmitter.notify({
         certificateId: revokedCertId,
         projectId: ca.projectId,
-        orgId: actorOrgId,
+        orgId,
         eventType: CertificateApplicationAlertEvent.Revocation,
         applicationId: revokedCertApplicationId
       });
@@ -820,17 +852,25 @@ export const certificateServiceFactory = ({
     // rebuild CRL (TODO: move to interval-based cron job)
     // Only rebuild CRL for internal CAs - external CAs manage their own CRLs
     if (!ca.externalCa?.id) {
-      await rebuildCaCrl({
-        caId: ca.id,
-        certificateAuthorityDAL,
-        certificateAuthorityCertDAL,
-        certificateAuthorityCrlDAL,
-        certificateAuthoritySecretDAL,
-        projectDAL,
-        certificateDAL,
-        kmsService,
-        caKeySourceService
-      });
+      // The revocation has committed, so a failed rebuild must not report the revocation itself as failed.
+      try {
+        await rebuildCaCrl({
+          caId: ca.id,
+          certificateAuthorityDAL,
+          certificateAuthorityCertDAL,
+          certificateAuthorityCrlDAL,
+          certificateAuthoritySecretDAL,
+          projectDAL,
+          certificateDAL,
+          kmsService,
+          caKeySourceService
+        });
+      } catch (error) {
+        logger.error(
+          error,
+          `Failed to rebuild CRL after revoking certificate [certificateId=${cert.id}] [caId=${ca.id}]`
+        );
+      }
     }
 
     if (!cert.deletedAt) {
@@ -846,8 +886,11 @@ export const certificateServiceFactory = ({
       }
     }
 
-    // Return appropriate CA format based on CA type
-    const caResult = ca.externalCa?.id
+    return revokedAt;
+  };
+
+  const $toRevocationCaResult = (ca: TRevocationCa) =>
+    ca.externalCa?.id
       ? {
           id: ca.id,
           name: ca.name,
@@ -859,7 +902,226 @@ export const certificateServiceFactory = ({
         }
       : expandInternalCa(ca);
 
-    return { revokedAt, cert, applicationName: await $resolveApplicationName(cert.applicationId), ca: caResult };
+  const $matchRevocationApprovalPolicy = async (cert: TRevocableCertificate, projectId: string) => {
+    if (!cert.applicationId || !cert.profileId) return null;
+
+    const profile = await certificateProfileDAL.findByIdWithConfigs(cert.profileId);
+    if (!profile) return null;
+
+    const policy = (await approvalPolicyService.matchPolicy(ApprovalPolicyType.CertRevocation, projectId, {
+      profileName: profile.slug,
+      applicationId: cert.applicationId
+    })) as TCertRevocationPolicy | null;
+    if (!policy) return null;
+
+    return { policy, profile, applicationId: cert.applicationId };
+  };
+
+  const $resolveRevocationRequester = async (actor: ActorType, actorId: string) => {
+    if (actor === ActorType.USER) {
+      const user = await userDAL.findById(actorId);
+      return {
+        requesterUserId: actorId,
+        machineIdentityId: null,
+        requesterName: `${user?.firstName || ""} ${user?.lastName || ""}`.trim() || user?.email || "Unknown User",
+        requesterEmail: user?.email || ""
+      };
+    }
+
+    if (actor === ActorType.IDENTITY) {
+      const identity = await identityDAL.findById(actorId);
+      return {
+        requesterUserId: null,
+        machineIdentityId: actorId,
+        requesterName: identity?.name || "Machine Identity",
+        requesterEmail: ""
+      };
+    }
+
+    throw new BadRequestError({ message: "Only users and machine identities can request a certificate revocation" });
+  };
+
+  const revokeCert = async ({
+    id,
+    serialNumber,
+    thumbprint,
+    revocationReason,
+    actorId,
+    actorAuthMethod,
+    actor,
+    actorOrgId
+  }: TRevokeCertDTO) => {
+    const cert = await $findCertificateToRevoke({ id, serialNumber, thumbprint, actorOrgId });
+    const ca = await $loadRevocationCa(cert);
+
+    await assertCanRevokeCertificate({
+      certificate: { ...cert, projectId: ca.projectId },
+      actor,
+      actorId,
+      actorAuthMethod,
+      actorOrgId,
+      permissionService,
+      resourceMetadataDAL
+    });
+
+    await $assertCertificateRevocable(cert, ca);
+
+    const applicationName = await $resolveApplicationName(cert.applicationId);
+    const caResult = $toRevocationCaResult(ca);
+
+    const approval = await $matchRevocationApprovalPolicy(cert, ca.projectId);
+    if (approval) {
+      const { policy, profile, applicationId } = approval;
+      const requester = await $resolveRevocationRequester(actor, actorId);
+      const steps = await approvalPolicyDAL.findStepsByPolicyId(policy.id);
+      const requestData: TCertRevocationRequestData = {
+        certificateId: cert.id,
+        serialNumber: cert.serialNumber,
+        commonName: cert.commonName,
+        profileId: profile.id,
+        profileName: profile.slug,
+        applicationId,
+        revocationReason
+      };
+
+      const { request: approvalRequest, notifyApprovers } = await certificateDAL.transaction(async (tx) => {
+        // Locking the certificate serializes revocation requests for it, so two concurrent requests can't
+        // both pass the pending check below.
+        await certificateDAL.findByIdForUpdate(cert.id, tx);
+
+        const pending = await certificateDAL.findPendingRevocationApprovalRequest(
+          { certificateId: cert.id, projectId: ca.projectId },
+          tx
+        );
+        if (pending) {
+          if (!pending.expiresAt || new Date(pending.expiresAt) > new Date()) {
+            throw new BadRequestError({
+              message: `A revocation of certificate '${getCertificateDisplayName(cert)}' is already waiting for approval.`
+            });
+          }
+          // Expiry is applied lazily, so a lapsed request still reads as pending until something marks it.
+          await approvalRequestDAL.updateById(pending.id, { status: ApprovalRequestStatus.Expired }, tx);
+        }
+
+        return approvalPolicyService.createRequestFromPolicy({
+          projectId: ca.projectId,
+          organizationId: actorOrgId,
+          policy: { ...policy, steps },
+          requestData,
+          justification: null,
+          expiresAt: policy.maxRequestTtl ? new Date(Date.now() + ms(policy.maxRequestTtl)) : null,
+          ...requester,
+          deferApproverNotification: true,
+          tx
+        });
+      });
+
+      await notifyApprovers();
+
+      return {
+        status: CertificateRevocationStatus.PendingApproval as const,
+        approvalRequestId: approvalRequest.id,
+        approvalPolicyId: policy.id,
+        cert,
+        applicationName,
+        ca: caResult
+      };
+    }
+
+    const revokedAt = await $performRevocation({ cert, ca, revocationReason, orgId: actorOrgId });
+
+    return {
+      status: CertificateRevocationStatus.Revoked as const,
+      revokedAt,
+      cert,
+      applicationName,
+      ca: caResult
+    };
+  };
+
+  // Runs once an approval request for a revocation is approved, with no caller waiting on it, so it records
+  // its outcome in the audit log instead of throwing.
+  const revokeApprovedCertificate = async (approvalRequest: TApprovalRequest) => {
+    const { certificateId, revocationReason } = approvalRequest.requestData.requestData as TCertRevocationRequestData;
+    const auditActor = { type: ActorType.PLATFORM as const, metadata: {} };
+
+    const cert = await certificateDAL.findById(certificateId);
+    try {
+      if (!cert) {
+        throw new NotFoundError({ message: `Certificate '${certificateId}' no longer exists.` });
+      }
+
+      if (cert.status === CertStatus.REVOKED) {
+        logger.info(
+          `Approved revocation skipped: certificate already revoked [certificateId=${cert.id}] [approvalRequestId=${approvalRequest.id}]`
+        );
+        return;
+      }
+
+      const ca = await $loadRevocationCa(cert);
+      await $assertCertificateRevocable(cert, ca);
+      await $performRevocation({ cert, ca, revocationReason, orgId: approvalRequest.organizationId });
+
+      await auditLogService.createAuditLog({
+        projectId: ca.projectId,
+        actor: auditActor,
+        event: {
+          type: EventType.REVOKE_CERT,
+          metadata: {
+            certId: cert.id,
+            cn: cert.commonName,
+            serialNumber: cert.serialNumber,
+            applicationId: cert.applicationId,
+            applicationName: await $resolveApplicationName(cert.applicationId),
+            revocationReason,
+            approvalRequestId: approvalRequest.id
+          }
+        }
+      });
+
+      const requesterDistinctId = approvalRequest.machineIdentityId
+        ? `identity-${approvalRequest.machineIdentityId}`
+        : approvalRequest.requesterId && approvalRequest.requesterEmail;
+      if (requesterDistinctId) {
+        await telemetryService.sendPostHogEvents({
+          event: PostHogEventTypes.CertificateRevoked,
+          distinctId: requesterDistinctId,
+          organizationId: approvalRequest.organizationId,
+          properties: {
+            orgId: approvalRequest.organizationId,
+            projectId: ca.projectId,
+            revocationReason
+          }
+        });
+      }
+    } catch (error) {
+      logger.error(
+        error,
+        `Failed to revoke certificate after approval [certificateId=${certificateId}] [approvalRequestId=${approvalRequest.id}]`
+      );
+
+      const reason =
+        error instanceof BadRequestError || error instanceof NotFoundError
+          ? error.message
+          : "The certificate authority didn't revoke the certificate. It is still active; request the revocation again once the certificate authority is reachable.";
+
+      await auditLogService.createAuditLog({
+        projectId: approvalRequest.projectId,
+        actor: auditActor,
+        event: {
+          type: EventType.CERT_REVOCATION_FAILED,
+          metadata: {
+            certId: certificateId,
+            cn: cert?.commonName,
+            serialNumber: cert?.serialNumber,
+            applicationId: cert?.applicationId,
+            revocationReason,
+            approvalRequestId: approvalRequest.id,
+            error: reason
+          }
+        }
+      });
+    }
   };
 
   /**
@@ -1861,6 +2123,7 @@ export const certificateServiceFactory = ({
     getCertPrivateKey,
     deleteCert,
     revokeCert,
+    revokeApprovedCertificate,
     getCertBody,
     importCert,
     getCertBundle,
